@@ -1,11 +1,13 @@
 (ns metabase.driver.cubejs.query-processor
   (:require [clojure.set :as set]
-            [cheshire.core :as json]
-            [flatland.ordered.map :as ordered-map]
+            [toucan.db :as db]
             [metabase.mbql.util :as mbql.u]
             [metabase.util.date-2 :as u.date]
             [metabase.query-processor.store :as qp.store]
-            [metabase.driver.cubejs.utils :as cube.utils]))
+            [metabase.models.metric :as metric :refer [Metric]]
+            [metabase.driver.cubejs.utils :as cube.utils]
+            [metabase.query-processor.middleware.annotate :as annotate]
+            [java-time :as time]))
 
 
 (def ^:dynamic ^:private *query* nil)
@@ -14,6 +16,9 @@
   ["afterDate", "beforeDate", "inDateRange", "notInDateRange"])
 
 ;;; ----------------------------------------------------- common -----------------------------------------------------
+
+(defn get-metric-cube-name [metric-display-name table-id]
+  (:cube-name (:definition (db/select-one Metric :name metric-display-name :table_id table-id :archived false))))
 
 (defn- is-datetime-field?
   [[ftype & _] [vtype & _]]
@@ -52,14 +57,18 @@
 
 (defn ^:private mbql-granularity->cubejs-granularity
   [granularity]
-  (let [cubejs-granularity (granularity {:default :day
-                                         :year    :year
-                                         :month   :month
-                                         :week    :week
-                                         :day     :day
-                                         :hour    :hour
-                                         :minute  :minute
-                                         :second  :second})]
+  (let [cubejs-granularity (granularity {:default       :day
+                                         :year          :year
+                                         :month         :month
+                                         :week          :week
+                                         :day           :day
+                                         :hour          :hour
+                                         :minute        :minute
+                                         :second        :second
+                                         :month-of-year :month
+                                         :day-of-year   :day
+                                         :day-of-month  :day
+                                         :day-of-week   :day})] ;; TODO  :day :week-of-year :minute-of-hour, :hour-of-day Not Suported
     (if (nil? cubejs-granularity)
       (throw (Exception. (str (name granularity) " granularity not supported by Cube.js")))
       cubejs-granularity)))
@@ -83,7 +92,7 @@
   (:name (qp.store/field field-id)))
 
 (defmethod ->rvalue :aggregation-options [[_ _ ag-names]]
-  (:display-name ag-names))
+  (get-metric-cube-name (:display-name ag-names) (:source-table *query*)))
 
 (defmethod ->rvalue :aggregation [[_ value]]
   (if (number? value)
@@ -194,64 +203,6 @@
 
 (defmethod parse-filter :not [[_ subclause]] (parse-filter (negate subclause)))
 
-(defn- transform-filters
-  "Transform the MBQL filters to Cube.js filters."
-  [query]
-  (let [filter  (:filter query)
-        filters (if filter (parse-filter filter) nil)
-        raw     (flatten (if (vector? filters) filters (if filters (conj [] filters) nil)))
-        result  (filterv #(not (is-datetime-operator? (:operator %))) raw)]
-    {:filters result}))
-
-;;; ---------------------------------------------------- order-by ----------------------------------------------------
-
-(defn- handle-order-by
-  [{:keys [order-by]}]
-    ;; Iterate over the order-by fields.
-  {:order (into {} (for [[direction field] order-by]
-                     {(->rvalue field) direction}))})
-
-;;; ----------------------------------------------------- limit ------------------------------------------------------
-
-(defn- handle-limit
-  [{:keys [limit]}]
-  (if-not (nil? limit)
-    {:limit limit}
-    nil))
-
-;;; ----------------------------------------------------- fields -----------------------------------------------------
-
-(defmulti ^:private ->cubefield
-  "Same like the `->rvalue`, but with the value returns the field type and other optional values too."
-  {:arglists '([x])}
-  mbql.u/dispatch-by-clause-name-or-class)
-
-(defmethod ->cubefield nil
-  [_]
-  nil)
-
-(defmethod ->cubefield Object
-  [this]
-  this)
-
-(defmethod ->cubefield :field-id
-  [[_ field-id]]
-  (let [field (qp.store/field field-id)]
-    {:name (:name field) :type (keyword (:description field))}))
-
-(defmethod ->cubefield :aggregation-options [[_ _ ag-names]]
-  (if-let [display-name (:display-name ag-names)]
-    {:name display-name :type :measure}
-    nil))
-
-(defmethod ->cubefield :datetime-field
-  [[_ field granularity]]
-  (let [field (->cubefield field)]
-    {:name (:name field)
-     :type :timeDimension
-     :granularity (mbql-granularity->cubejs-granularity granularity)}))
-
-
 (defn- datetime-filter-optimizer
   "Optimize the datetime filters. If we have more than one filter for a field, merge them into a single `inDateRange` filter."
   [result new]
@@ -295,6 +246,68 @@
         optimized-filters  (reduce datetime-filter-optimizer [] datetime-filters)]
     optimized-filters))
 
+(defn- transform-filters
+  "Transform the MBQL filters to Cube.js filters."
+  [query]
+  (let [filter               (:filter query)
+        filters              (if filter (parse-filter filter) nil)
+        raw                  (flatten (if (vector? filters) filters (if filters (conj [] filters) nil)))
+        non-datetime-filters (filterv #(not (is-datetime-operator? (:operator %))) raw)
+        datetime-filters     (optimize-datetime-filters raw)
+        result               (into [] (concat non-datetime-filters (filterv #(and (is-datetime-operator? (:operator %)) (< (count (:values %)) 2)) datetime-filters)))]
+    {:filters result}))
+
+;;; ---------------------------------------------------- order-by ----------------------------------------------------
+
+(defn- handle-order-by
+  [{:keys [order-by]}]
+    ;; Iterate over the order-by fields.
+  {:order (into {} (for [[direction field] order-by]
+                     {(->rvalue field) direction}))})
+
+;;; ----------------------------------------------------- limit ------------------------------------------------------
+
+(defn- handle-limit
+  [{:keys [limit]}]
+  (if-not (nil? limit)
+    (let [limit-limit 50000]
+      {:limit (if (> limit limit-limit)
+                limit-limit
+                limit)})
+    nil))
+
+;;; ----------------------------------------------------- fields -----------------------------------------------------
+
+(defmulti ^:private ->cubefield
+  "Same like the `->rvalue`, but with the value returns the field type and other optional values too."
+  {:arglists '([x])}
+  mbql.u/dispatch-by-clause-name-or-class)
+
+(defmethod ->cubefield nil
+  [_]
+  nil)
+
+(defmethod ->cubefield Object
+  [this]
+  this)
+
+(defmethod ->cubefield :field-id
+  [[_ field-id]]
+  (let [field (qp.store/field field-id)]
+    {:name (:name field) :type (keyword (:description field))}))
+
+(defmethod ->cubefield :aggregation-options [[_ _ ag-names]]
+  (if-let [metric-cube-name (get-metric-cube-name (:display-name ag-names) (:source-table *query*))]
+    {:name metric-cube-name :type :measure}
+    nil))
+
+(defmethod ->cubefield :datetime-field
+  [[_ field granularity]]
+  (let [field (->cubefield field)]
+    {:name (:name field)
+     :type :timeDimension
+     :granularity (mbql-granularity->cubejs-granularity granularity)}))
+
 (defn- handle-datetime-filter
   [date-filter]
   (let [date-filters       (if date-filter (parse-filter date-filter) nil)
@@ -302,7 +315,9 @@
         cube-date-filters  (optimize-datetime-filters raw-filters)
         result-fields      {}]
     (reduce (fn [result-fields, cube-date-filter]
-              (assoc result-fields (:member cube-date-filter) {:type :timeDimension :name (:member cube-date-filter) :dateRange (:values cube-date-filter)}))
+              (if (< (count (:values cube-date-filter)) 2)
+                result-fields
+                (assoc result-fields (:member cube-date-filter) {:type :timeDimension :name (:member cube-date-filter) :dateRange (:values cube-date-filter)})))
             result-fields
             cube-date-filters)))
 
@@ -334,11 +349,11 @@
 
 (defn- handle-fields
   [{:keys [filter fields aggregation breakout]}]
-  (let [time-dimensions-filter (if filter (handle-datetime-filter (concat filter)) nil)
-        fields-all       (concat fields aggregation breakout)
-        cube-fields      (set (for [field fields-all] (->cubefield field)))
-        time-dimensions  (handle-datetime-fields time-dimensions-filter cube-fields)
-        result           (handle-measures-dimensions-fields cube-fields)]
+  (let [time-dimensions-filter (if filter (handle-datetime-filter filter) nil)
+        fields-all             (concat fields aggregation breakout)
+        cube-fields            (set (for [field fields-all] (->cubefield field)))
+        time-dimensions        (handle-datetime-fields time-dimensions-filter cube-fields)
+        result                 (handle-measures-dimensions-fields cube-fields)]
     (reduce (fn [result new]
               (case (:type new)
                 :timeDimension (update result :timeDimensions #(conj % {:dimension (:name new) :dateRange (:dateRange new)}))
@@ -359,6 +374,81 @@
           order-by        (handle-order-by query)
           limit           (handle-limit query)]
       (merge fields filters order-by limit))))
+
+;;; ----------------------------------------------- datetime granularity preprocessing ------------------------------------------------
+
+(def ^:private post-process-granularity
+  [:month-of-year, :day-of-year, :day-of-month, :day-of-week ])  ;; TODO :week-of-year :minute-of-hour, :hour-of-day Not Suported
+
+(defn- is-process-granularity?
+  [granularity]
+  (some #(= granularity %) post-process-granularity))
+
+(defmulti ^:private ->datetime-granularity
+  "Same like the `->rvalue`, but with the value returns the field type and other optional values too."
+  {:arglists '([x])}
+  mbql.u/dispatch-by-clause-name-or-class)
+
+(defmethod ->datetime-granularity Object
+  [this]
+  this)
+
+(defmethod ->datetime-granularity :field-id
+  [[_ field-id]]
+  (let [field (qp.store/field field-id)]
+    {:name (keyword (:name field)) :type (keyword (:description field))}))
+
+(defmethod ->datetime-granularity :datetime-field
+  [[_ field granularity]]
+  (let [field (->datetime-granularity field)]
+    {:name (keyword (:name field))
+     :granularity granularity}))
+
+(defn pre-datetime-granularity
+  [{:keys [breakout]}]
+    (let [time-breakouts            (set (for [field breakout] (->datetime-granularity field)))
+          filtered-time-breakouts   (filterv #(is-process-granularity? (:granularity %)) time-breakouts)]
+    filtered-time-breakouts))
+;;; ----------------------------------------------- datetime granularity postprocessing  ------------------------------------------------
+
+(defmulti ^:private extract-date (fn [granularity date] granularity))
+
+
+(defmethod extract-date :month-of-year [_ date]
+  (.getValue (time/month date)))
+
+(defmethod extract-date :day-of-year [_ date]
+  (.getValue (time/day-of-year date)))
+
+(defmethod extract-date :day-of-month [_ date]
+  (.getValue (time/day-of-month date)))
+
+(defmethod extract-date :day-of-week [_ date]
+  (let [java-day  (.getValue (time/day-of-week date))
+        moved-day  (+ java-day 1)]
+        (if (> moved-day 7)
+          1 ;; Sunday
+          moved-day)))
+
+; (defmethod extract-date :week-of-year [_ date]
+; ) TODO :week-of-year
+
+; (defmethod extract-date :minute-of-hour [_ date]
+; ) TODO :minute-of-hour
+
+; (defmethod extract-date :hour-of-day [_ date]
+; ) TODO :hour-of-day
+
+(defn update-row-values-datetime-granularity
+  [date-granularity-fields field-name date]
+  (let [granularity (reduce (fn [granularity date-granularity-field]
+                      (if (= field-name (:name date-granularity-field))
+                        (:granularity date-granularity-field)
+                        granularity))
+                      {} date-granularity-fields)]
+    (if-not (nil? granularity)
+      (extract-date granularity (time/local-date-time date))
+      date)))
 
 ;;; ----------------------------------------------- result processing ------------------------------------------------
 
@@ -385,26 +475,36 @@
                   {name ((keyword (:type info)) cube.utils/cubejs-type->base-type)})))))
 
 (defn- update-row-values
-  [row cols]
+  [row num-cols date-granularity-cols]
   (reduce-kv
    (fn [row key val]
-     (assoc row key (if (some #(= key %) cols) (parse-number val) val))) {} row))
+    (let [num-val     (if (some #(= key %) num-cols) (parse-number val) val)
+          result-val  (if (some #(= key (:name %)) date-granularity-cols) (update-row-values-datetime-granularity date-granularity-cols key num-val ) num-val)]
+    (assoc row key result-val)))
+    {} row))
 
 (defn- convert-values
   "Convert the values in the rows to the correct type."
-  [rows types]
+  [rows types date-granularity-cols]
   ;; Get the number fields from the types.
   (let [num-cols  (map first (filter #(= (second %) :type/Number) types))]
-    (map #(update-row-values % num-cols) rows)))
+    (map #(update-row-values % num-cols date-granularity-cols) rows)))
 
-(defn execute-http-request [native-query]
-  (if (and (:mbql? native-query) (empty? (:measures (:query native-query))) (empty? (:dimensions (:query native-query))) (empty? (:timeDimensions (:query native-query))))
-    {:rows []}
-    (let [query         (if (:mbql? native-query) (json/generate-string (:query native-query)) (:query native-query))
-          resp          (cube.utils/make-request "v1/load" query nil)
-          rows          (:data (:body resp))
-          annotation    (:annotation (:body resp))
-          types         (get-types annotation)
-          rows          (convert-values rows types)
-          result        {:rows (for [row rows] (into (ordered-map/ordered-map) (set/rename-keys row (:measure-aliases native-query))))}]
-      result)))
+(defn execute-http-request [query respond]
+  (let [native          (:native query)
+        native-query    (:query native)
+        resp            (cube.utils/make-request "v1/load" native-query nil)
+        rows            (:data (:body resp))
+        annotation      (:annotation (:body resp))
+        types           (get-types annotation)
+        aliases         (:measure-aliases native)
+        cols            (vec (for [name (keys (first rows))] {:name (mbql.u/qualified-name (if-let [orig-name ((keyword name) aliases)] orig-name name))}))
+        rows            (convert-values rows types (:date-granularity-fields native))
+        cols-info       (annotate/merged-column-info query {:cols cols})
+        cols-name       (map #(keyword (:name %)) cols-info)
+        reverse-aliases (set/map-invert aliases)
+        cols-name-cube  (for [col-name cols-name] (if-let [cube-name (col-name reverse-aliases)] cube-name col-name))
+        result          (for [row rows] ((apply juxt cols-name-cube) row))]
+    (respond
+     {:cols cols}
+     result)))
